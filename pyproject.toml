@@ -12,5 +12,6 @@ dependencies = [
     "pandas==3.0.5",
     "plotly>=7.0.0",
     "pygam==0.12.0",
+    "scikit-learn>=1.9.1",
     "seaborn==0.13.2",
 ]
