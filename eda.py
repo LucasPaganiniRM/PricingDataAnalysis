@@ -1,15 +1,17 @@
 #%%
-import pandas as pd
+from IPython.core import getipython
 import matplotlib.pyplot as plt
-import seaborn as sns
 import numpy as np
-from pygam import ExpectileGAM, LinearGAM,s
-from sklearn.preprocessing import OneHotEncoder
+import pandas as pd
+import seaborn as sns
+from pygam import ExpectileGAM
+from sklearn.linear_model import QuantileRegressor
+
 # %%
 
 df=pd.read_csv('sales_data_analysis.csv')
 # %%
-print(f'Quantidade de colunas - {str(len(list(df.columns)))}\n{50*"="}')
+print(f'Quantidade de colunas - {len(list(df.columns))!s}\n{50*"="}')
 print(df.dtypes)
 print(f'\n{50*"="}\n{df.count()}')
 df.head(10)
@@ -222,159 +224,175 @@ plt.tight_layout()
 plt.show()
 
 # %%
-df.rename(
-    columns={
-        'Purchase Type': 'purchase_type',
-    },
-    inplace=True,
-)
+# Função dinâmica que calcula utilizando GAM ou Log-Log e retorna dataframe
+def model_predict_quantiles(df_input: pd.DataFrame, method: str = 'Log-log',quantiles: list=[0.1, 0.25, 0.5, 0.75, 0.9]) -> pd.DataFrame:
+    unique_products = list(df_input['Product'].unique())
+    calculed_quantiles = pd.DataFrame()
+
+    for prod in unique_products:
+        # 1. Filtra o subset do produto preservando o índice original
+        sub_df = df_input.loc[df_input['Product'] == prod].copy()
+        
+        # 2. Prepara X e Y diretamente do subset
+        if method == 'Log-log':
+            X = np.log(sub_df[['Price']])
+            Y = np.log(sub_df['Quantity'])
+        elif method == 'GAM':
+            X = sub_df['Price']
+            Y = sub_df['Quantity']
+        else:
+            raise ValueError(f"Método não encontrado: {method}, escolha entre 'GAM' ou 'Log-log'.")
+
+        # 3. Acumula todos os quantis deste produto
+        prod_results = {}
+        for q in quantiles:
+            if method == 'Log-log':
+                model = QuantileRegressor(quantile=q, alpha=1.0)
+                model.fit(X, Y)
+                prod_results[f"q_{q}"] = np.exp(model.predict(X))
+            elif method == 'GAM':
+                model = ExpectileGAM(terms='auto', expectile=q)
+                model.fit(X, Y)
+                prod_results[f"q_{q}"] = model.predict(X)
+
+        # 4. Cria o DataFrame com o mesmo índice do subset
+        quantiles_df = pd.DataFrame(prod_results, index=sub_df.index)
+        
+        # 5. Concatena colunas do produto com as predições
+        temp_df = pd.concat([sub_df[['Product', 'Price', 'Quantity', 'Revenue']], quantiles_df], axis=1)
+        calculed_quantiles = pd.concat([calculed_quantiles, temp_df], axis=0)
+
+    return calculed_quantiles
 
 # %%
-encoder = OneHotEncoder(sparse_output=False)
-dados_codificados = encoder.fit_transform(df[['purchase_type']])
-nomes_colunas = encoder.get_feature_names_out(['purchase_type'])
-df_codificado = pd.DataFrame(dados_codificados, columns=nomes_colunas)
-pd.concat([df, df_codificado], axis=1)
-
-# %%
-
-
-
-# Calcula o Expectile (Quartil com GAM) iterando por Produto
-unique_products=list(df['Product'].unique())
-calculed_expectiles=pd.DataFrame()
-
-for i in unique_products:
-    df_product = df.loc[df['Product'] == i]
-    quantiles=[0.1,0.25,0.5,0.75,0.9]
-    gam_results={}
-    X=df_product[['Price','purchase_type_Drive-thru','purchase_type_In-store','purchase_type_Online']]
-    Y=df_product['Quantity']
-
-    for q in quantiles:
-        gam= ExpectileGAM(terms='auto',expectile=q)
-        gam.fit(X, Y)
-        gam_results[f"q_{q}"] = gam.predict(X)
-    
-    gam_calcuted=pd.DataFrame(gam_results).set_index(X.index)
-    temp_df=pd.concat([df_product[['Product','Price','Quantity','Revenue']],gam_calcuted],axis=1)
-    
-    calculed_expectiles=pd.concat([calculed_expectiles,temp_df],axis=0)
-
-calculed_expectiles
-
+quantiles=[0.1, 0.25, 0.5, 0.75, 0.9]
+df_loglog=model_predict_quantiles(df_input=df, method='Log-log',quantiles=quantiles)
+df_gam=model_predict_quantiles(df_input=df, method='GAM',quantiles=quantiles)
 
 # %%
 for q in quantiles:
-    calculed_expectiles[f'revenue_{q}'] = calculed_expectiles[f'q_{q}'] * calculed_expectiles['Price']
+    df_gam[f'revenue_{q}'] = df_gam[f'q_{q}'] * df_gam['Price']
+    df_loglog[f'revenue_{q}'] = df_loglog[f'q_{q}'] * df_loglog['Price']
+
 
 # %%
-price_optimo=calculed_expectiles.sort_values('revenue_0.5',ascending=False).drop_duplicates(subset='Product',keep='first').reset_index(drop=True)
+price_optimo_gam=df_gam.sort_values('revenue_0.5',ascending=False).drop_duplicates(subset='Product',keep='first').reset_index(drop=True)
+price_optimo_loglog=df_loglog.sort_values('revenue_0.5',ascending=False).drop_duplicates(subset='Product',keep='first').reset_index(drop=True)
 
-price_optimo.head(10)
+price_optimo_gam.head(10)
 # %%
 
-sns.set_theme(style="whitegrid")
+def visualize_predictions(df_input: pd.DataFrame, price_optimo: pd.DataFrame, method: str):
+    sns.set_theme(style="whitegrid")
 
-# 2. Inicializar o grid facetado por produto com escalas livres
-g = sns.FacetGrid(
-    data=calculed_expectiles,
-    col="Product",
-    col_wrap=2,  # Ajuste o número de colunas conforme preferir
-    sharex=False,  # scales="free"
-    sharey=False,
-    height=4,
-    aspect=1.2,
-)
-
-# 3. Função para desenhar as camadas de cada faceta
-def plot_gam_layer(data, **kws):
-    # É fundamental ordenar por 'price' para o ribbon e a linha ficarem contínuos
-    df_sorted = data.sort_values("Price")
-
-    # geom_ribbon (Intervalo 2.5% a 97.5%)
-    plt.fill_between(
-        df_sorted["Price"],
-        df_sorted["q_0.1"],
-        df_sorted["q_0.9"],
-        color="#d3d3d3",
-        alpha=0.75,
+    # Inicializar o grid facetado por produto
+    g = sns.FacetGrid(
+        data=df_input,
+        col="Product",
+        col_wrap=2,
+        sharex=False,
+        sharey=False,
+        height=4,
+        aspect=1.2,
     )
 
-    # geom_line (Predição central)
-    plt.plot(
-        df_sorted["Price"],
-        df_sorted["q_0.5"],
-        color="blue",
-        linewidth=1.3,
-        label="Predição",
-    )
+    # Função para desenhar as camadas por produto
+    def _plot_product_facet(data, **kws):
+        # Ordenar por 'Price'
+        df_sorted = data.sort_values("Price")
 
-    # geom_point (Dispersão dos dados observados)
-    plt.scatter(
-        data["Price"],
-        data["Quantity"],
-        alpha=0.5,
-        s=25,
-        color="#2b5c8f",  # Ajuste para a cor desejada dos pontos
-    )
-    # Destaque em vermelho do preço ótimo calculado para o revenue do quartil 0.5 (q_0.5)
-    product_name = data["Product"].iloc[0]
-    opt = price_optimo[price_optimo["Product"] == product_name]
+        # Intervalo dos quantis 0.1 a 0.9
+        plt.fill_between(
+            df_sorted["Price"],
+            df_sorted["q_0.1"],
+            df_sorted["q_0.9"],
+            color="#d3d3d3",
+            alpha=0.75,
+            label="Intervalo (q0.1 - q0.9)",
+        )
 
-    plt.scatter(
-        opt["Price"],
-        opt["q_0.5"],
-        color="red",
-        s=80,
-        edgecolors="black",
-        linewidths=1.2,
-        zorder=5,
-        label="Preço Ótimo (q=0.5)",
-    )
+        # Predição central da mediana (q=0.5)
+        plt.plot(
+            df_sorted["Price"],
+            df_sorted["q_0.5"],
+            color="blue",
+            linewidth=1.3,
+            label="Predição (q=0.5)",
+        )
 
+        # Dispersão dos dados observados
+        plt.scatter(
+            data["Price"],
+            data["Quantity"],
+            alpha=0.5,
+            s=25,
+            color="#2b5c8f",
+            label="Observado",
+        )
 
-# 4. Mapear os dados na função
-g.map_dataframe(plot_gam_layer)
+        # Destaque em vermelho do preço ótimo do produto
+        product_name = data["Product"].iloc[0]
+        opt = price_optimo[price_optimo["Product"] == product_name]
 
-# 5. Ajustes de rótulos, títulos e tamanho
-g.set_axis_labels("Price", "Quantity Sold")
-g.set_titles(col_template="{col_name}")
-g.fig.subplots_adjust(top=0.9)
-g.fig.suptitle("GAM Price vs Quantity Model", fontsize=14, fontweight="bold")
+        if not opt.empty:
+            plt.scatter(
+                opt["Price"],
+                opt["q_0.5"],
+                color="red",
+                s=80,
+                edgecolors="black",
+                linewidths=1.2,
+                zorder=5,
+                label="Preço Ótimo (q=0.5)",
+            )
 
-plt.show()
+    # Mapear os dados na função para cada faceta
+    g.map_dataframe(_plot_product_facet)
+
+    # Ajustes de rótulos, títulos, legenda e layout
+    g.set_axis_labels("Price", "Quantity Sold")
+    g.set_titles(col_template="{col_name}", size=12, weight="bold")
+    g.add_legend()
+    g.fig.subplots_adjust(top=0.9)
+    g.fig.suptitle(f"{method} Predict vs Quantity Model", fontsize=14, fontweight="bold")
+
+    plt.show()
+
+# %%
+visualize_predictions(df_input=df_gam, price_optimo=price_optimo_gam,method='GAM')
+
+#%% 
+visualize_predictions(df_input=df_loglog, price_optimo=price_optimo_loglog,method='Log-log')
+
 # %%
 # Comparação utilzando modelo log-log com o PyGAM
 
-gam_loglog_results=pd.DataFrame()
+loglog_results=pd.DataFrame()
 for i in unique_products:
     df_product = df.loc[df['Product'] == i]
     df_product['ln_price'] = np.log(df_product['Price'])
     df_product['ln_quantity'] = np.log(df_product['Quantity'])
 
-    X=df_product['ln_price']
+    X=df_product[['ln_price']]
     Y=df_product['ln_quantity']
-    gam_loglog = LinearGAM(
-        s(0, n_splines=15),
-        fit_intercept=True
-    )
+    results={}
 
-    # 3. Treinar o modelo
-    gam_loglog.fit(X, Y)
-    pred_quantities = gam_loglog.predict(X)
-    
-    gam_loglog_calcuted=pd.DataFrame({'ln_quantities':pred_quantities}).set_index(X.index)
-    gam_loglog_calcuted['Quantity_predict']=np.exp(gam_loglog_calcuted['ln_quantities'])
-    gam_loglog_calcuted['Revenue_predict'] = gam_loglog_calcuted['Quantity_predict'] * df_product['Price']
-    temp_df=pd.concat([df_product[['Product','Price','Quantity','Revenue']],gam_loglog_calcuted],axis=1)
+    for q in quantiles:
+        model = QuantileRegressor(quantile=q, alpha=1.0)
+        model.fit(X,Y)
+        pred_quantities = model.predict(X)
+        results[f'q_{q}']=np.exp(pred_quantities)
+        loglog_calcuted=pd.DataFrame(results).set_index(X.index)
 
-    gam_loglog_results=pd.concat([gam_loglog_results,temp_df],axis=0)
+    loglog_calcuted['Quantity_predict']=loglog_calcuted['q_0.5']
+    loglog_calcuted['Revenue_predict'] = loglog_calcuted['Quantity_predict'] * df_product['Price']
+    temp_df=pd.concat([df_product[['Product','Price','Quantity','Revenue']],loglog_calcuted],axis=1)
 
-gam_loglog_results
+    loglog_results=pd.concat([loglog_results,temp_df],axis=0)
+
+loglog_results
 # %%
-price_optimo_loglog=gam_loglog_results.sort_values('Revenue_predict',ascending=False).drop_duplicates(subset='Product',keep='first').reset_index(drop=True)
 
-price_optimo_loglog.head(10)
-# %%
+price_optimo=loglog_results.sort_values('revenue_0.5',ascending=False).drop_duplicates(subset='Product',keep='first').reset_index(drop=True)
+price_optimo=price_optimo[['Product','Price','Revenue']]
 # %%
