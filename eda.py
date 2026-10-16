@@ -9,7 +9,7 @@ from sklearn.linear_model import QuantileRegressor
 
 # %%
 
-df=pd.read_csv('sales_data_analysis.csv')
+df=pd.read_csv(r'data/raw/laptop_pricing_dataset.csv')
 # %%
 print(f'Quantidade de colunas - {len(list(df.columns))!s}\n{50*"="}')
 print(df.dtypes)
