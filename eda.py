@@ -247,7 +247,7 @@ def model_predict_quantiles(df_input: pd.DataFrame, method: str = 'Log-log',quan
         prod_results = {}
         for q in quantiles:
             if method == 'Log-log':
-                model = QuantileRegressor(quantile=q, alpha=1.0)
+                model = QuantileRegressor(quantile=q, alpha=0)
                 model.fit(X, Y)
                 prod_results[f"q_{q}"] = np.exp(model.predict(X))
             elif method == 'GAM':
@@ -363,36 +363,3 @@ visualize_predictions(df_input=df_gam, price_optimo=price_optimo_gam,method='GAM
 
 #%% 
 visualize_predictions(df_input=df_loglog, price_optimo=price_optimo_loglog,method='Log-log')
-
-# %%
-# Comparação utilzando modelo log-log com o PyGAM
-
-loglog_results=pd.DataFrame()
-for i in unique_products:
-    df_product = df.loc[df['Product'] == i]
-    df_product['ln_price'] = np.log(df_product['Price'])
-    df_product['ln_quantity'] = np.log(df_product['Quantity'])
-
-    X=df_product[['ln_price']]
-    Y=df_product['ln_quantity']
-    results={}
-
-    for q in quantiles:
-        model = QuantileRegressor(quantile=q, alpha=1.0)
-        model.fit(X,Y)
-        pred_quantities = model.predict(X)
-        results[f'q_{q}']=np.exp(pred_quantities)
-        loglog_calcuted=pd.DataFrame(results).set_index(X.index)
-
-    loglog_calcuted['Quantity_predict']=loglog_calcuted['q_0.5']
-    loglog_calcuted['Revenue_predict'] = loglog_calcuted['Quantity_predict'] * df_product['Price']
-    temp_df=pd.concat([df_product[['Product','Price','Quantity','Revenue']],loglog_calcuted],axis=1)
-
-    loglog_results=pd.concat([loglog_results,temp_df],axis=0)
-
-loglog_results
-# %%
-
-price_optimo=loglog_results.sort_values('revenue_0.5',ascending=False).drop_duplicates(subset='Product',keep='first').reset_index(drop=True)
-price_optimo=price_optimo[['Product','Price','Revenue']]
-# %%
