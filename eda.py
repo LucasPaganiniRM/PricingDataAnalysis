@@ -6,7 +6,8 @@ import pandas as pd
 import seaborn as sns
 from pygam import ExpectileGAM
 from sklearn.linear_model import QuantileRegressor
-
+from sklearn.metrics import mean_absolute_error, mean_squared_error, root_mean_squared_error, r2_score
+from sklearn.model_selection import train_test_split
 # %%
 
 df=pd.read_csv(r'data/raw/sales_data_analysis.csv')
@@ -165,16 +166,6 @@ plt.show()
 list(df['Product'].unique())
 
 # %%
-# Remove outliers de acordo com o preço por categoria
-# Calcula Q1, Q3 e IQR por produto sem alterar o tamanho do DataFrame
-q1 = df.groupby('Product')['Price'].transform(lambda x: x.quantile(0.25))
-q3 = df.groupby('Product')['Price'].transform(lambda x: x.quantile(0.75))
-iqr = q3 - q1
-
-# Mantém apenas o que está dentro do intervalo aceitável
-df = df[(df['Price'] >= (q1 - 1.5 * iqr)) & (df['Price'] <= (q3 + 1.5 * iqr))]
-
-# %%
 
 # Criando uma List Comprehension para filtrar colunas categoricas
 target_cols = [
@@ -224,62 +215,201 @@ plt.tight_layout()
 plt.show()
 
 # %%
-# Função dinâmica que calcula utilizando GAM ou Log-Log e retorna dataframe
-def model_predict_quantiles(df_input: pd.DataFrame, method: str = 'Log-log',quantiles: list=[0.1, 0.25, 0.5, 0.75, 0.9]) -> pd.DataFrame:
-    unique_products = list(df_input['Product'].unique())
-    calculed_quantiles = pd.DataFrame()
+# Separando treino e teste evitando data leakage
+df_train, df_test = train_test_split(
+    df,
+    test_size=0.20,
+    random_state=42,
+    stratify=df['Product']
+)
+
+print(f"Total de registros: {len(df)}")
+print(f"Conjunto de Treino (80%): {len(df_train)} amostras")
+print(f"Conjunto de Teste (20%): {len(df_test)} amostras")
+
+# %%
+# 2. Remoção de outliers por IQR calculada no treino
+iqr_bounds = {}
+for prod in df_train['Product'].unique():
+    prod_prices = df_train.loc[df_train['Product'] == prod, 'Price']
+    q1 = prod_prices.quantile(0.25)
+    q3 = prod_prices.quantile(0.75)
+    iqr = q3 - q1
+    iqr_bounds[prod] = (q1 - 1.5 * iqr, q3 + 1.5 * iqr)
+
+# Aplica o filtro exclusivamente no conjunto de treino
+df_train_clean = df_train[
+    df_train.apply(lambda row: iqr_bounds[row['Product']][0] <= row['Price'] <= iqr_bounds[row['Product']][1], axis=1)
+].copy()
+
+print(f"Treino antes do filtro de IQR: {len(df_train)} amostras")
+print(f"Treino após filtro de IQR: {len(df_train_clean)} amostras ({len(df_train) - len(df_train_clean)} outliers removidos)")
+
+# %%
+def model_predict_quantiles(
+    train_df: pd.DataFrame,
+    test_df: pd.DataFrame = None,
+    method: str = 'Log-log',
+    quantiles: list = [0.1, 0.25, 0.5, 0.75, 0.9]
+):
+    """
+    Treina modelos de quantis (Log-log ou GAM) estritamente no conjunto de treino para cada produto.
+    """
+    unique_products = list(train_df['Product'].unique())
+    calculed_train_quantiles = pd.DataFrame()
+    calculed_test_quantiles = pd.DataFrame()
 
     for prod in unique_products:
-        # 1. Filtra o subset do produto preservando o índice original
-        sub_df = df_input.loc[df_input['Product'] == prod].copy()
-        
-        # 2. Prepara X e Y diretamente do subset
+        sub_train = train_df.loc[train_df['Product'] == prod].copy()
+
+        # Define qual método será utilizado
         if method == 'Log-log':
-            X = np.log(sub_df[['Price']])
-            Y = np.log(sub_df['Quantity'])
+            X_train = np.log(sub_train[['Price']])
+            Y_train = np.log(sub_train['Quantity'])
         elif method == 'GAM':
-            X = sub_df['Price']
-            Y = sub_df['Quantity']
+            X_train = sub_train[['Price']]
+            Y_train = sub_train['Quantity']
         else:
             raise ValueError(f"Método não encontrado: {method}, escolha entre 'GAM' ou 'Log-log'.")
 
-        # 3. Acumula todos os quantis deste produto
-        prod_results = {}
+        # Prepara o conjunto de testes 
+        if test_df is not None:
+            sub_test = test_df.loc[test_df['Product'] == prod].copy()
+            if method == 'Log-log':
+                X_test = np.log(sub_test[['Price']])
+            elif method == 'GAM':
+                X_test = sub_test[['Price']]
+
+        # Calcula os resultados por Quartil/Expectil
+        prod_train_results = {}
+        prod_test_results = {}
+
         for q in quantiles:
             if method == 'Log-log':
                 model = QuantileRegressor(quantile=q, alpha=0)
-                model.fit(X, Y)
-                prod_results[f"q_{q}"] = np.exp(model.predict(X))
+                model.fit(X_train, Y_train)
+                prod_train_results[f"q_{q}"] = np.exp(model.predict(X_train))
+                if test_df is not None:
+                    prod_test_results[f"q_{q}"] = np.exp(model.predict(X_test))
             elif method == 'GAM':
                 model = ExpectileGAM(terms='auto', expectile=q)
-                model.fit(X, Y)
-                prod_results[f"q_{q}"] = model.predict(X)
+                model.fit(
+                    X_train.values if hasattr(X_train, 'values') else X_train,
+                    Y_train.values if hasattr(Y_train, 'values') else Y_train
+                )
+                prod_train_results[f"q_{q}"] = model.predict(
+                    X_train.values if hasattr(X_train, 'values') else X_train
+                )
+                if test_df is not None:
+                    prod_test_results[f"q_{q}"] = model.predict(
+                        X_test.values if hasattr(X_test, 'values') else X_test
+                    )
 
-        # 4. Cria o DataFrame com o mesmo índice do subset
-        quantiles_df = pd.DataFrame(prod_results, index=sub_df.index)
-        
-        # 5. Concatena colunas do produto com as predições
-        temp_df = pd.concat([sub_df[['Product', 'Price', 'Quantity', 'Revenue']], quantiles_df], axis=1)
-        calculed_quantiles = pd.concat([calculed_quantiles, temp_df], axis=0)
+        # resultados do treino
+        quantiles_train_df = pd.DataFrame(prod_train_results, index=sub_train.index)
+        temp_train = pd.concat([sub_train[['Product', 'Price', 'Quantity', 'Revenue']], quantiles_train_df], axis=1)
+        calculed_train_quantiles = pd.concat([calculed_train_quantiles, temp_train], axis=0)
 
-    return calculed_quantiles
+        # Contecatenando os resultados do teste 
+        if test_df is not None:
+            quantiles_test_df = pd.DataFrame(prod_test_results, index=sub_test.index)
+            temp_test = pd.concat([sub_test[['Product', 'Price', 'Quantity', 'Revenue']], quantiles_test_df], axis=1)
+            calculed_test_quantiles = pd.concat([calculed_test_quantiles, temp_test], axis=0)
+
+    # Calculando a receita estimada
+    for q in quantiles:
+        calculed_train_quantiles[f'revenue_{q}'] = calculed_train_quantiles[f'q_{q}'] * calculed_train_quantiles['Price']
+        if test_df is not None:
+            calculed_test_quantiles[f'revenue_{q}'] = calculed_test_quantiles[f'q_{q}'] * calculed_test_quantiles['Price']
+
+    if test_df is not None:
+        return calculed_train_quantiles, calculed_test_quantiles
+    return calculed_train_quantiles
 
 # %%
-quantiles=[0.1, 0.25, 0.5, 0.75, 0.9]
-df_loglog=model_predict_quantiles(df_input=df, method='Log-log',quantiles=quantiles)
-df_gam=model_predict_quantiles(df_input=df, method='GAM',quantiles=quantiles)
+quantiles = [0.1, 0.25, 0.5, 0.75, 0.9]
+
+#Log log
+df_train_loglog, df_test_loglog = model_predict_quantiles(
+    train_df=df_train_clean,
+    test_df=df_test,
+    method='Log-log',
+    quantiles=quantiles
+)
+
+# GAM
+df_train_gam, df_test_gam = model_predict_quantiles(
+    train_df=df_train_clean,
+    test_df=df_test,
+    method='GAM',
+    quantiles=quantiles
+)
 
 # %%
-for q in quantiles:
-    df_gam[f'revenue_{q}'] = df_gam[f'q_{q}'] * df_gam['Price']
-    df_loglog[f'revenue_{q}'] = df_loglog[f'q_{q}'] * df_loglog['Price']
+# Métricas de validação
+def calculate_validation_metrics(df_test_preds: pd.DataFrame, model_name: str = 'Model') -> pd.DataFrame:
+    """
+    Calcula as métricas de validação importadas do scikit-learn (MAE, MSE, RMSE e R²)
+    comparando a demanda real observada no teste ('Quantity') com a predição central ('q_0.5').
+    """
+    metrics = []
 
+    # Métrica Global (Todos os produtos combinados no teste)
+    y_true_global = df_test_preds['Quantity']
+    y_pred_global = df_test_preds['q_0.5']
+
+    metrics.append({
+        'Modelo': model_name,
+        'Produto': 'Global (Todos)',
+        'Amostras': len(y_true_global),
+        'MAE': mean_absolute_error(y_true_global, y_pred_global),
+        'MSE': mean_squared_error(y_true_global, y_pred_global),
+        'RMSE': root_mean_squared_error(y_true_global, y_pred_global),
+        'R2': r2_score(y_true_global, y_pred_global)
+    })
+
+    # Métricas individualmente por produto
+    for prod in df_test_preds['Product'].unique():
+        sub = df_test_preds[df_test_preds['Product'] == prod]
+        y_true = sub['Quantity']
+        y_pred = sub['q_0.5']
+        metrics.append({
+            'Modelo': model_name,
+            'Produto': prod,
+            'Amostras': len(sub),
+            'MAE': mean_absolute_error(y_true, y_pred),
+            'MSE': mean_squared_error(y_true, y_pred),
+            'RMSE': root_mean_squared_error(y_true, y_pred),
+            'R2': r2_score(y_true, y_pred)
+        })
+
+    return pd.DataFrame(metrics)
+
+# Avaliação dos modelos no conjunto de teste não visto
+metrics_loglog = calculate_validation_metrics(df_test_loglog, model_name='Log-log')
+metrics_gam = calculate_validation_metrics(df_test_gam, model_name='GAM')
+
+# Tabela comparativa consolidada
+df_validation_metrics = pd.concat([metrics_loglog, metrics_gam], ignore_index=True)
+
+print("=" * 78)
+print("RELATÓRIO DE MÉTRICAS DE VALIDAÇÃO NO CONJUNTO DE TESTE (SEM DATA LEAKAGE)")
+print("=" * 78)
+print(df_validation_metrics.round(4).to_string(index=False))
+print("=" * 78)
 
 # %%
-price_optimo_gam=df_gam.sort_values('revenue_0.5',ascending=False).drop_duplicates(subset='Product',keep='first').reset_index(drop=True)
-price_optimo_loglog=df_loglog.sort_values('revenue_0.5',ascending=False).drop_duplicates(subset='Product',keep='first').reset_index(drop=True)
+# Determinação do Preço Ótimo (calculado a partir das predições de treino)
+price_optimo_gam = df_train_gam.sort_values('revenue_0.5', ascending=False).drop_duplicates(subset='Product', keep='first').reset_index(drop=True)
+price_optimo_loglog = df_train_loglog.sort_values('revenue_0.5', ascending=False).drop_duplicates(subset='Product', keep='first').reset_index(drop=True)
 
-price_optimo_gam.head(10)
+print('\nPreço Ótimo - GAM:')
+print(price_optimo_gam[['Product', 'Price', 'Quantity', 'revenue_0.5']].head(5))
+
+print('\nPreço Ótimo - Log-log:')
+print(price_optimo_loglog[['Product', 'Price', 'Quantity', 'revenue_0.5']].head(5))
+
+
 # %%
 
 def visualize_predictions(df_input: pd.DataFrame, price_optimo: pd.DataFrame, method: str):
@@ -359,7 +489,20 @@ def visualize_predictions(df_input: pd.DataFrame, price_optimo: pd.DataFrame, me
     plt.show()
 
 # %%
-visualize_predictions(df_input=df_gam, price_optimo=price_optimo_gam,method='GAM')
+# Visualização do ajuste e preço ótimo com dados de Treino
+visualize_predictions(df_input=df_train_gam, price_optimo=price_optimo_gam, method='GAM (Treino)')
 
-#%% 
-visualize_predictions(df_input=df_loglog, price_optimo=price_optimo_loglog,method='Log-log')
+# %% 
+visualize_predictions(df_input=df_train_loglog, price_optimo=price_optimo_loglog, method='Log-log (Treino)')
+
+# %%
+# Visualização das predições contra os dados observados no conjunto de Teste (Validação)
+visualize_predictions(df_input=df_test_gam, price_optimo=price_optimo_gam, method='GAM (Teste/Validação)')
+
+# %%
+visualize_predictions(df_input=df_test_loglog, price_optimo=price_optimo_loglog, method='Log-log (Teste/Validação)')
+
+
+
+
+# %%
