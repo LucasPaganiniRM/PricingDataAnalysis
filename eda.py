@@ -46,6 +46,7 @@ def add_price_variation(
     max_variation=0.25, # Variação máxima de 25%
     elasticity=-1.3, # Elasticidade-preço da demanda
     city_multipliers=None, # Multiplicadores de preço por cidade
+    cost_rate=0.35, # % alíquota que representará o custo do produto (ou dict por produto)
     outlier_prob=0.05, # Probabilidade de ocorrência de outliers
     random_state=42 # Seed para reprodutibilidade
 ):
@@ -66,7 +67,9 @@ def add_price_variation(
        - Preço: liquidações relâmpago profundas (-30% a -45%) ou cobranças de eventos/aeroporto (+30% a +45%).
        - Demanda: pedidos volumosos em lote/catering (bulk) ou rupturas operacionais de estoque (stockouts).
        
-    4. Atualização de Receita: df['Revenue'] = df['Price'] * df['Quantity'].
+    4. Custo Unitário e Margens:
+       - Adiciona coluna 'Cost' (Custo Marginal / Custo Unitário) com base na alíquota percentual fixa sobre o preço base dos produtos.
+       - Atualiza Receita ('Revenue'), Custo Total ('Total_Cost') e Lucro ('Profit').
     """
     rng = np.random.default_rng(random_state)
     df = df.copy()
@@ -114,9 +117,19 @@ def add_price_variation(
         
         df[quantity_col] = np.round(np.maximum(simulated_qty, 1)).astype(int)
     
-    # 4. Atualização da Receita
+    # 4. Alíquota de custo fixo (% do preço base) representando o Custo Unitário
+    if isinstance(cost_rate, dict):
+        prod_cost_rate = df['Product'].map(cost_rate).fillna(0.35)
+    else:
+        prod_cost_rate = cost_rate
+    
+    df['Cost'] = (base_prices * prod_cost_rate).round(2)
+
+    # 5. Atualização de Receita, Custo Total e Lucro
     if 'Revenue' in df.columns or quantity_col in df.columns:
         df['Revenue'] = (df[price_col] * df[quantity_col]).round(2)
+        df['Total_Cost'] = (df['Cost'] * df[quantity_col]).round(2)
+        df['Profit'] = (df['Revenue'] - df['Total_Cost']).round(2)
         
     return df
 
@@ -130,15 +143,15 @@ city_multipliers = {
     'Lisbon': -0.09
 }
 
-
 df = add_price_variation(
     df,
     price_col='Price',
     quantity_col='Quantity',
     city_col='City',
     max_variation=0.25,
-    elasticity=-1.3,
+    elasticity=-1.118,
     city_multipliers=city_multipliers,
+    cost_rate=0.18,
     outlier_prob=0.05,
     random_state=42
 )
@@ -306,21 +319,42 @@ def model_predict_quantiles(
                     )
 
         # resultados do treino
+        base_cols = [c for c in ['Product', 'Price', 'Cost', 'Quantity', 'Revenue', 'Profit'] if c in sub_train.columns]
         quantiles_train_df = pd.DataFrame(prod_train_results, index=sub_train.index)
-        temp_train = pd.concat([sub_train[['Product', 'Price', 'Quantity', 'Revenue']], quantiles_train_df], axis=1)
+        temp_train = pd.concat([sub_train[base_cols], quantiles_train_df], axis=1)
         calculed_train_quantiles = pd.concat([calculed_train_quantiles, temp_train], axis=0)
 
         # Contecatenando os resultados do teste 
         if test_df is not None:
+            base_cols_test = [c for c in ['Product', 'Price', 'Cost', 'Quantity', 'Revenue', 'Profit'] if c in sub_test.columns]
             quantiles_test_df = pd.DataFrame(prod_test_results, index=sub_test.index)
-            temp_test = pd.concat([sub_test[['Product', 'Price', 'Quantity', 'Revenue']], quantiles_test_df], axis=1)
+            temp_test = pd.concat([sub_test[base_cols_test], quantiles_test_df], axis=1)
             calculed_test_quantiles = pd.concat([calculed_test_quantiles, temp_test], axis=0)
 
-    # Calculando a receita estimada
+    # Calculando a receita estimada, lucro e Markup de Lerner
     for q in quantiles:
         calculed_train_quantiles[f'revenue_{q}'] = calculed_train_quantiles[f'q_{q}'] * calculed_train_quantiles['Price']
+        if 'Cost' in calculed_train_quantiles.columns:
+            calculed_train_quantiles[f'profit_{q}'] = (
+                (calculed_train_quantiles['Price'] - calculed_train_quantiles['Cost']) * calculed_train_quantiles[f'q_{q}']
+            )
+
         if test_df is not None:
             calculed_test_quantiles[f'revenue_{q}'] = calculed_test_quantiles[f'q_{q}'] * calculed_test_quantiles['Price']
+            if 'Cost' in calculed_test_quantiles.columns:
+                calculed_test_quantiles[f'profit_{q}'] = (
+                    (calculed_test_quantiles['Price'] - calculed_test_quantiles['Cost']) * calculed_test_quantiles[f'q_{q}']
+                )
+
+    # Índice de Lerner observado por linha: L = (P - MC) / P
+    if 'Cost' in calculed_train_quantiles.columns:
+        calculed_train_quantiles['lerner_index'] = (
+            (calculed_train_quantiles['Price'] - calculed_train_quantiles['Cost']) / calculed_train_quantiles['Price']
+        )
+        if test_df is not None:
+            calculed_test_quantiles['lerner_index'] = (
+                (calculed_test_quantiles['Price'] - calculed_test_quantiles['Cost']) / calculed_test_quantiles['Price']
+            )
 
     if test_df is not None:
         return calculed_train_quantiles, calculed_test_quantiles
@@ -393,21 +427,79 @@ metrics_gam = calculate_validation_metrics(df_test_gam, model_name='GAM')
 df_validation_metrics = pd.concat([metrics_loglog, metrics_gam], ignore_index=True)
 
 print("=" * 78)
-print("RELATÓRIO DE MÉTRICAS DE VALIDAÇÃO NO CONJUNTO DE TESTE (SEM DATA LEAKAGE)")
+print("RELATÓRIO DE MÉTRICAS DE VALIDAÇÃO NO CONJUNTO DE TESTE")
 print("=" * 78)
 print(df_validation_metrics.round(4).to_string(index=False))
 print("=" * 78)
 
 # %%
-# Determinação do Preço Ótimo (calculado a partir das predições de treino)
-price_optimo_gam = df_train_gam.sort_values('revenue_0.5', ascending=False).drop_duplicates(subset='Product', keep='first').reset_index(drop=True)
-price_optimo_loglog = df_train_loglog.sort_values('revenue_0.5', ascending=False).drop_duplicates(subset='Product', keep='first').reset_index(drop=True)
+# Determinação do Preço Ótimo via Markup de Lerner (Maximização de Lucro / Margem de Contribuição)
+# Fórmula: Lucro = (Preço - Custo Marginal) * Quantidade_0.5
+def optimization_price_algorithm(df_train: pd.DataFrame) -> pd.DataFrame:
+    """
+    Calcula a precificação ótima teórica segundo a Regra do Markup de Lerner:
+    (P - MC) / P = 1 / |elasticidade| => P* = MC * (|elasticidade| / (|elasticidade| - 1))
+    """
+    records = []
+    for prod in df_train['Product'].unique():
+        sub = df_train[df_train['Product'] == prod]
 
-print('\nPreço Ótimo - GAM:')
-print(price_optimo_gam[['Product', 'Price', 'Quantity', 'revenue_0.5']].head(5))
+        # Transformam em log-log e aplica regressão quantílica
+        X = np.log(sub[['Price']])
+        y = np.log(sub['Quantity'])
+        qr = QuantileRegressor(quantile=0.5, alpha=0).fit(X, y)
+        
+        # Calcula elasticidade, que é a diferença da quantidade demandada em função da variação percentual de preço
+        elasticity = qr.coef_[0]
+        cost = sub['Cost'].iloc[0]
+        abs_e = abs(elasticity) #Transforma em absoluto
+        
+        # Fórmula de Lerner só aceita elasticidade absoluta maior que 1
+        if abs_e > 1:
+            lerner_markup_factor = abs_e / (abs_e - 1)
+            p_opt_lerner = cost * lerner_markup_factor
+            lerner_index = 1.0 / abs_e
+        else:
+            lerner_markup_factor = np.nan
+            p_opt_lerner = np.nan
+            lerner_index = np.nan
+            
+        records.append({
+            'Product': prod,
+            'Cost (MC)': cost,
+            'Elasticidade (e)': round(elasticity, 4),
+            'Markup Teórico (P/MC)': round(lerner_markup_factor, 4) if pd.notna(lerner_markup_factor) else np.nan,
+            'Índice Lerner Teórico (1/|e|)': round(lerner_index, 4) if pd.notna(lerner_index) else np.nan,
+            'Preço Ótimo Teórico (Lerner)': round(p_opt_lerner, 2) if pd.notna(p_opt_lerner) else np.nan
+        })
+    return pd.DataFrame(records)
 
-print('\nPreço Ótimo - Log-log:')
-print(price_optimo_loglog[['Product', 'Price', 'Quantity', 'revenue_0.5']].head(5))
+df_lerner_theoretical = optimization_price_algorithm(df_train_clean)
+print("\n" + "=" * 78)
+print("REGRA TEÓRICA DO MARKUP DE LERNER POR PRODUTO")
+print("=" * 78)
+print(df_lerner_theoretical.to_string(index=False))
+print("=" * 78)
+
+# 2. Preço Ótimo Empírico via Modelos (GAM e Log-log) maximizando Lucro (profit_0.5)
+price_optimo_gam = (
+    df_train_gam.sort_values('profit_0.5', ascending=False)
+    .drop_duplicates(subset='Product', keep='first')
+    .reset_index(drop=True)
+)
+price_optimo_loglog = (
+    df_train_loglog.sort_values('profit_0.5', ascending=False)
+    .drop_duplicates(subset='Product', keep='first')
+    .reset_index(drop=True)
+)
+
+cols_display = ['Product', 'Price', 'Cost', 'lerner_index', 'Quantity', 'revenue_0.5', 'profit_0.5']
+
+print('\nPreço Ótimo (Markup de Lerner / Lucro) - GAM:')
+print(price_optimo_gam[cols_display].round(4).to_string(index=False))
+
+print('\nPreço Ótimo (Markup de Lerner / Lucro) - Log-log:')
+print(price_optimo_loglog[cols_display].round(4).to_string(index=False))
 
 
 # %%
@@ -473,7 +565,7 @@ def visualize_predictions(df_input: pd.DataFrame, price_optimo: pd.DataFrame, me
                 edgecolors="black",
                 linewidths=1.2,
                 zorder=5,
-                label="Preço Ótimo (q=0.5)",
+                label="Preço Ótimo (Markup de Lerner)",
             )
 
     # Mapear os dados na função para cada faceta
@@ -484,7 +576,7 @@ def visualize_predictions(df_input: pd.DataFrame, price_optimo: pd.DataFrame, me
     g.set_titles(col_template="{col_name}", size=12, weight="bold")
     g.add_legend()
     g.fig.subplots_adjust(top=0.9)
-    g.fig.suptitle(f"{method} Predict vs Quantity Model", fontsize=14, fontweight="bold")
+    g.fig.suptitle(f"{method} - Otimização de Preço via Markup de Lerner", fontsize=14, fontweight="bold")
 
     plt.show()
 
